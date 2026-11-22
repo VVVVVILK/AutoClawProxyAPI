@@ -32,8 +32,10 @@ func TestThreeHeaderSetsIsolated(t *testing.T) {
 	if reqChat.Header.Get("X-Request-Model") != "glm-5.3-flash" {
 		t.Fatalf("对话头缺少 X-Request-Model")
 	}
-	if reqChat.Header.Get("x_trace_id") != "autoclaw2api" {
-		t.Fatalf("对话头 x_trace_id 应为 autoclaw2api，实际: %s", reqChat.Header.Get("x_trace_id"))
+	traceID := reqChat.Header.Get("X-Trace-Id")
+	xTraceID := reqChat.Header.Get("x_trace_id")
+	if len(traceID) != 16 || xTraceID != traceID || xTraceID == "autoclaw2api" {
+		t.Fatalf("对话头 X-Trace-Id 与 x_trace_id 应共用 16 位随机 hex 且不得硬编码项目名: X-Trace-Id=%s x_trace_id=%s", traceID, xTraceID)
 	}
 	if reqChat.Header.Get("X-Auth-Sign") != "" {
 		t.Fatalf("对话头不应混入 UserAPI 签名头")
@@ -171,4 +173,83 @@ func TestParseOAuthCallbackURL(t *testing.T) {
 	if okBad {
 		t.Fatalf("非回环域名回调应被拒绝")
 	}
+}
+
+func TestJWTTTLAndOAuthCallbackErrorAndStreamUsage(t *testing.T) {
+	// 1. JWT iat/exp/ttl 解析（24h 国际版与 28d 国内版）
+	makeJWT := func(iat, exp int64) string {
+		b, _ := json.Marshal(map[string]any{"iat": iat, "exp": exp, "sub": "u1"})
+		enc := func(raw []byte) string {
+			const tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+			_ = tbl
+			return strings.TrimRight(strings.NewReplacer("+", "-", "/", "_").Replace(
+				string(mustBase64Std(raw)),
+			), "=")
+		}
+		return enc([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc(b) + ".sig"
+	}
+	jwt24h := makeJWT(1700000000, 1700086400)
+	if ttl := JWTTTLSeconds(jwt24h); ttl != 86400 {
+		t.Fatalf("24h JWT TTL 解析异常: got=%d want=86400", ttl)
+	}
+	if iat := JWTIssuedAtSeconds(jwt24h); iat != 1700000000 {
+		t.Fatalf("JWT iat 解析异常: got=%d", iat)
+	}
+
+	// 2. OAuth 第二步换票 630014 单独映射且保留原始 code 与 msg
+	cbMsg := explainOAuthCallbackBizError(630014, "抱歉,审核失败,请重新尝试")
+	if strings.Contains(cbMsg, "滑动验证") || !strings.Contains(cbMsg, "code=630014") || !strings.Contains(cbMsg, "抱歉,审核失败,请重新尝试") {
+		t.Fatalf("换票阶段 630014 报错文案不符合预期: %s", cbMsg)
+	}
+
+	// 3. 流式默认补齐 stream_options.include_usage=true，显式 false 不覆盖，非流式不注入
+	streamIn := `{"model":"glm-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	var streamOut map[string]any
+	_ = json.Unmarshal(PrepareOutboundChatBody([]byte(streamIn), "glm-5"), &streamOut)
+	so, ok := streamOut["stream_options"].(map[string]any)
+	if !ok || so["include_usage"] != true {
+		t.Fatalf("流式请求应默认补齐 stream_options.include_usage=true: %+v", streamOut["stream_options"])
+	}
+
+	explicitFalse := `{"model":"glm-5","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}`
+	var falseOut map[string]any
+	_ = json.Unmarshal(PrepareOutboundChatBody([]byte(explicitFalse), "glm-5"), &falseOut)
+	if falseOut["stream_options"].(map[string]any)["include_usage"] != false {
+		t.Fatalf("显式传入 include_usage=false 不应被覆盖")
+	}
+
+	nonStream := `{"model":"glm-5","stream":false,"messages":[{"role":"user","content":"hi"}]}`
+	var nonStreamOut map[string]any
+	_ = json.Unmarshal(PrepareOutboundChatBody([]byte(nonStream), "glm-5"), &nonStreamOut)
+	if _, exists := nonStreamOut["stream_options"]; exists {
+		t.Fatalf("非流式请求不应注入 stream_options")
+	}
+}
+
+func mustBase64Std(b []byte) []byte {
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	out := make([]byte, 0, ((len(b)+2)/3)*4)
+	for i := 0; i < len(b); i += 3 {
+		var n uint32
+		rem := len(b) - i
+		n |= uint32(b[i]) << 16
+		if rem > 1 {
+			n |= uint32(b[i+1]) << 8
+		}
+		if rem > 2 {
+			n |= uint32(b[i+2])
+		}
+		out = append(out, chars[(n>>18)&63], chars[(n>>12)&63])
+		if rem > 1 {
+			out = append(out, chars[(n>>6)&63])
+		} else {
+			out = append(out, '=')
+		}
+		if rem > 2 {
+			out = append(out, chars[n&63])
+		} else {
+			out = append(out, '=')
+		}
+	}
+	return out
 }

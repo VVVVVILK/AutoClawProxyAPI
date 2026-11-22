@@ -105,23 +105,37 @@ type PoolStats struct {
 	TotalBalance float64 `json:"total_balance"`
 }
 
-// Pool 管理任意数量的国内版与国际版账号，支持目录热更新、轮询调度与故障冷却。
+const (
+	defaultStickyTTL = 15 * time.Minute
+	maxStickyEntries = 4096
+)
+
+type stickyBinding struct {
+	accountID string
+	expiresAt time.Time
+}
+
+// Pool 管理任意数量的国内版与国际版账号，支持目录热更新、轮询调度、短时会话粘性与故障冷却。
 type Pool struct {
-	mu      sync.RWMutex
-	cfgMgr  *config.Manager
-	logger  *logging.Logger
-	items   map[string]*Account
-	order   []string
-	rrIndex map[string]uint64
+	mu        sync.RWMutex
+	cfgMgr    *config.Manager
+	logger    *logging.Logger
+	items     map[string]*Account
+	order     []string
+	rrIndex   map[string]uint64
+	sticky    map[string]stickyBinding
+	stickyTTL time.Duration
 }
 
 // NewPool 创建多账号池并立刻从凭证目录完成首次扫描加载。
 func NewPool(cfgMgr *config.Manager, logger *logging.Logger) (*Pool, error) {
 	p := &Pool{
-		cfgMgr:  cfgMgr,
-		logger:  logger,
-		items:   make(map[string]*Account),
-		rrIndex: make(map[string]uint64),
+		cfgMgr:    cfgMgr,
+		logger:    logger,
+		items:     make(map[string]*Account),
+		rrIndex:   make(map[string]uint64),
+		sticky:    make(map[string]stickyBinding),
+		stickyTTL: defaultStickyTTL,
 	}
 	if err := p.SyncFromDisk(); err != nil {
 		return nil, err
@@ -232,10 +246,44 @@ func (p *Pool) rebuildOrderLocked() {
 
 // Acquire 按轮询策略选择一个可用的就绪账号（region 为空表示双区联合调度，exclude 用于单请求故障切号避让）。
 func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Account, bool) {
+	return p.AcquireSticky(region, "", exclude)
+}
+
+// AcquireSticky 支持按会话粘性键优先命中已绑定的就绪账号（15 分钟滑动有效期，提升上游 Prompt Cache 命中率）；
+// 若已绑定账号处于冷却/失效/被排除，则自动轮询切号并改绑至新账号。
+func (p *Pool) AcquireSticky(region protocol.Region, stickyKey string, exclude map[string]bool) (*Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
+	ttl := p.stickyTTL
+	if ttl <= 0 {
+		ttl = defaultStickyTTL
+	}
+	key := strings.TrimSpace(stickyKey)
+
+	if key != "" {
+		if b, ok := p.sticky[key]; ok {
+			if now.Before(b.expiresAt) {
+				if exclude == nil || !exclude[b.accountID] {
+					if acc, exists := p.items[b.accountID]; exists &&
+						(region == "" || acc.Cred.Region == region) &&
+						acc.EffectiveStatus(now) == StatusOnline {
+						p.sticky[key] = stickyBinding{
+							accountID: acc.ID,
+							expiresAt: now.Add(ttl),
+						}
+						acc.TotalRequests++
+						snap := *acc
+						return &snap, true
+					}
+				}
+			} else {
+				delete(p.sticky, key)
+			}
+		}
+	}
+
 	candidates := make([]*Account, 0, len(p.order))
 	for _, id := range p.order {
 		if exclude != nil && exclude[id] {
@@ -263,8 +311,68 @@ func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Accoun
 
 	chosen := candidates[idx]
 	chosen.TotalRequests++
+	if key != "" {
+		p.pruneStickyLocked(now)
+		p.sticky[key] = stickyBinding{
+			accountID: chosen.ID,
+			expiresAt: now.Add(ttl),
+		}
+	}
 	snap := *chosen
 	return &snap, true
+}
+
+// StickyAccountRegion 查询会话粘性键当前有效绑定的在线账号所在区域（用于跨区别名优先命中粘性区域）。
+func (p *Pool) StickyAccountRegion(stickyKey string, exclude map[string]bool) (protocol.Region, bool) {
+	key := strings.TrimSpace(stickyKey)
+	if key == "" {
+		return "", false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	b, ok := p.sticky[key]
+	if !ok {
+		return "", false
+	}
+	now := time.Now()
+	if !now.Before(b.expiresAt) {
+		return "", false
+	}
+	if exclude != nil && exclude[b.accountID] {
+		return "", false
+	}
+	acc, exists := p.items[b.accountID]
+	if !exists || acc.EffectiveStatus(now) != StatusOnline {
+		return "", false
+	}
+	return acc.Cred.Region, true
+}
+
+func (p *Pool) pruneStickyLocked(now time.Time) {
+	if len(p.sticky) < maxStickyEntries {
+		return
+	}
+	// 先惰性清理全部过期条目
+	for k, b := range p.sticky {
+		if !now.Before(b.expiresAt) {
+			delete(p.sticky, k)
+		}
+	}
+	// 若仍达到上限，淘汰最早过期的条目，控制内存占用有界
+	for len(p.sticky) >= maxStickyEntries {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, b := range p.sticky {
+			if oldestKey == "" || b.expiresAt.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = b.expiresAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(p.sticky, oldestKey)
+	}
 }
 
 // ReportSuccess 标记账号本次调用成功，清理残余错误状态。

@@ -263,6 +263,9 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 
 	authURL, err := protocol.RequestOAuthURL(r.Context(), client, baseURL, provider, navigateURI, body.CaptchaText, deviceID)
 	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("OAuth", "获取国际版 %s 授权链接失败: %v", strings.ToUpper(string(provider)), err)
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
@@ -330,6 +333,9 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 
 	data, err := protocol.ExchangeOAuthCode(r.Context(), client, baseURL, provider, code, upstreamState, sess.NavigateURI, sess.DeviceID)
 	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("OAuth", "国际版 %s 回调换票失败: %v", strings.ToUpper(string(provider)), err)
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

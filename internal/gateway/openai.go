@@ -61,8 +61,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stickyKey := deriveStickySessionKey(meta.Model, rawBody, rawBody)
+
 	if meta.Stream {
-		resp, usedAcc, err := s.executeChatStreamWithFailover(r.Context(), meta.Model, rawBody)
+		resp, usedAcc, err := s.executeChatStreamWithFailover(r.Context(), meta.Model, rawBody, stickyKey)
 		if err != nil {
 			writeOpenAIUpstreamError(w, err)
 			return
@@ -72,7 +74,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _, err := s.executeChatWithFailover(r.Context(), meta.Model, rawBody)
+	payload, _, err := s.executeChatWithFailover(r.Context(), meta.Model, rawBody, stickyKey)
 	if err != nil {
 		writeOpenAIUpstreamError(w, err)
 		return
@@ -100,8 +102,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stickyKey := deriveStickySessionKey(model, rawBody, chatBody)
+
 	if stream {
-		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
+		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody, stickyKey)
 		if err != nil {
 			writeOpenAIUpstreamError(w, err)
 			return
@@ -136,7 +140,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody)
+	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody, stickyKey)
 	if err != nil {
 		writeOpenAIUpstreamError(w, err)
 		return
@@ -176,8 +180,8 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, 
 	}
 }
 
-// executeChatWithFailover 执行带指数退避与自动切号故障转移的非流式对话请求。
-func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel string, chatBody []byte) ([]byte, *accounts.Account, error) {
+// executeChatWithFailover 执行带短时会话粘性、指数退避与自动切号故障转移的非流式对话请求。
+func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel string, chatBody []byte, stickyKey string) ([]byte, *accounts.Account, error) {
 	targets, err := s.router.ResolveTargets(requestedModel)
 	if err != nil {
 		return nil, nil, &protocol.UpstreamError{
@@ -193,7 +197,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
+		acc, target, ok := s.pickNextAccount(targets, stickyKey, triedAccounts)
 		if !ok {
 			if lastErr != nil {
 				return nil, nil, lastErr
@@ -256,8 +260,8 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 	return nil, nil, lastErr
 }
 
-// executeChatStreamWithFailover 执行带自动切号故障转移的流式 SSE 请求。
-func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedModel string, chatBody []byte) (*http.Response, *accounts.Account, error) {
+// executeChatStreamWithFailover 执行带短时会话粘性与自动切号故障转移的流式 SSE 请求。
+func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedModel string, chatBody []byte, stickyKey string) (*http.Response, *accounts.Account, error) {
 	targets, err := s.router.ResolveTargets(requestedModel)
 	if err != nil {
 		return nil, nil, &protocol.UpstreamError{
@@ -273,7 +277,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
+		acc, target, ok := s.pickNextAccount(targets, stickyKey, triedAccounts)
 		if !ok {
 			if lastErr != nil {
 				return nil, nil, lastErr
@@ -335,9 +339,20 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	return nil, nil, lastErr
 }
 
-func (s *Server) pickNextAccount(targets []accounts.RouteTarget, exclude map[string]bool) (*accounts.Account, accounts.RouteTarget, bool) {
+func (s *Server) pickNextAccount(targets []accounts.RouteTarget, stickyKey string, exclude map[string]bool) (*accounts.Account, accounts.RouteTarget, bool) {
+	if stickyKey != "" && len(targets) > 1 {
+		if stickyRegion, ok := s.pool.StickyAccountRegion(stickyKey, exclude); ok {
+			for _, target := range targets {
+				if target.Region == stickyRegion {
+					if acc, acquired := s.pool.AcquireSticky(target.Region, stickyKey, exclude); acquired {
+						return acc, target, true
+					}
+				}
+			}
+		}
+	}
 	for _, target := range targets {
-		if acc, ok := s.pool.Acquire(target.Region, exclude); ok {
+		if acc, ok := s.pool.AcquireSticky(target.Region, stickyKey, exclude); ok {
 			return acc, target, true
 		}
 	}

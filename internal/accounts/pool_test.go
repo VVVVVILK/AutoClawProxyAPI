@@ -252,13 +252,13 @@ func TestRouterRealtimeSyncAndEmptyWhenNoActiveAccount(t *testing.T) {
 		t.Fatalf("同步后应暴露 2 条记录，实际: %+v", got)
 	}
 
-	// 3. 上游探测失败时，返回明确错误且绝不回落编造静态假模型
+	// 3. 上游偶发探测失败且区域仍有活跃账号时，应保留上次成功同步的缓存模型并记录失败原因
 	failUpstream.Store(true)
 	if _, err := router.SyncRegionModels(context.Background(), protocol.RegionCN); err == nil {
 		t.Fatalf("上游探测失败时应返回错误")
 	}
-	if got := router.ListOpenAIModels(); len(got) != 0 {
-		t.Fatalf("探测失败后不应编造或残留假模型，实际: %+v", got)
+	if got := router.ListOpenAIModels(); len(got) != 2 {
+		t.Fatalf("仍有活跃账号时偶发探测失败应保留已同步模型缓存，实际: %+v", got)
 	}
 	st := router.SyncStatuses()["cn"]
 	if st.ErrorMessage == "" {
@@ -276,5 +276,53 @@ func TestRouterRealtimeSyncAndEmptyWhenNoActiveAccount(t *testing.T) {
 	}
 	if got := router.ListOpenAIModels(); len(got) != 0 {
 		t.Fatalf("最后一个账号停用后，该区模型目录应立即为空，实际: %+v", got)
+	}
+}
+
+func TestPoolStickySessionAndFailoverRebind(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	dataDir := filepath.Join(dir, "data")
+	mgr, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = mgr.Update(func(c *config.Config) error {
+		c.AuthDir = authDir
+		c.DataDir = dataDir
+		return nil
+	})
+	_ = os.MkdirAll(authDir, 0o755)
+	_ = os.WriteFile(filepath.Join(authDir, "autoclawglobal-g1.json"), []byte(`{"region":"global","accessToken":"tok-g1","userId":"g1"}`), 0o600)
+	_ = os.WriteFile(filepath.Join(authDir, "autoclawglobal-g2.json"), []byte(`{"region":"global","accessToken":"tok-g2","userId":"g2"}`), 0o600)
+
+	pool, err := NewPool(mgr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 同一会话键连续 5 次应稳定命中同一账号
+	first, ok := pool.AcquireSticky(protocol.RegionGlobal, "sess-alpha", nil)
+	if !ok {
+		t.Fatalf("首次获取粘性账号失败")
+	}
+	for i := 0; i < 5; i++ {
+		got, ok := pool.AcquireSticky(protocol.RegionGlobal, "sess-alpha", nil)
+		if !ok || got.ID != first.ID {
+			t.Fatalf("第 %d 次未命中粘性账号: got=%v want=%s", i, got, first.ID)
+		}
+	}
+
+	// 另一会话键应轮询分发到不同账号
+	other, ok := pool.AcquireSticky(protocol.RegionGlobal, "sess-beta", nil)
+	if !ok || other.ID == first.ID {
+		t.Fatalf("不同会话应轮询分配至其他账号: first=%s other=%v", first.ID, other)
+	}
+
+	// 已绑定账号触发 429 冷却后，应自动切号并改绑至新账号
+	pool.ReportError(first.ID, protocol.ClassifyError(429, 0, "rate limited", 60*time.Second))
+	rebound, ok := pool.AcquireSticky(protocol.RegionGlobal, "sess-alpha", nil)
+	if !ok || rebound.ID == first.ID {
+		t.Fatalf("原粘性账号冷却后应自动切号改绑: old=%s got=%v", first.ID, rebound)
 	}
 }

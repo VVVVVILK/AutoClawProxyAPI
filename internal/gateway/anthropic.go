@@ -27,8 +27,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	stickyKey := deriveStickySessionKey(model, rawBody, chatBody)
+
 	if stream {
-		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
+		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody, stickyKey)
 		if err != nil {
 			writeAnthropicUpstreamError(w, err)
 			return
@@ -63,7 +65,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody)
+	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody, stickyKey)
 	if err != nil {
 		writeAnthropicUpstreamError(w, err)
 		return

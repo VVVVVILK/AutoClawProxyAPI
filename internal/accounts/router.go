@@ -148,14 +148,24 @@ func (r *Router) SyncRegionModels(ctx context.Context, region protocol.Region) (
 	if lastErr != nil {
 		errMsg = lastErr.Error()
 	}
+	stillActive := len(r.activeAccountsForRegion(region)) > 0
 	r.mu.Lock()
-	delete(r.modelsByRegion, region)
+	keptCount := 0
+	if !stillActive {
+		delete(r.modelsByRegion, region)
+	} else {
+		keptCount = len(r.modelsByRegion[region])
+	}
 	r.lastSyncAt[region] = time.Now()
 	r.lastSyncErr[region] = errMsg
 	r.mu.Unlock()
 
 	if r.logger != nil {
-		r.logger.Warn("Router", "实时同步 %s 模型目录失败（不回落静态列表）: %s", region.DisplayName(), errMsg)
+		if stillActive && keptCount > 0 {
+			r.logger.Warn("Router", "实时同步 %s 模型目录瞬时失败，已保留上次同步的 %d 个缓存模型: %s", region.DisplayName(), keptCount, errMsg)
+		} else {
+			r.logger.Warn("Router", "实时同步 %s 模型目录失败（不回落静态列表）: %s", region.DisplayName(), errMsg)
+		}
 	}
 	return nil, errors.New(errMsg)
 }
