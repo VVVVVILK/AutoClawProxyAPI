@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 func (s *Server) handleAdminMihomoStatus(w http.ResponseWriter, _ *http.Request) {
@@ -53,12 +55,16 @@ func (s *Server) handleAdminMihomoConfigUpdate(w http.ResponseWriter, r *http.Re
 		Subscriptions        []string `json:"subscriptions"`
 		AutoProbeEnabled     *bool    `json:"auto_probe_enabled"`
 		AutoProbeIntervalMin *int     `json:"auto_probe_interval_min"`
+		MaxNodes             *int     `json:"max_nodes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求参数解析失败"})
 		return
 	}
-	snap, err := s.mihomoMgr.UpdateConfig(r.Context(), body.Enabled, body.Subscriptions, body.AutoProbeEnabled, body.AutoProbeIntervalMin)
+	// 大订阅首次同步需要下载 provider 并重启内核，脱离浏览器请求上下文，避免客户端超时导致同步中断。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+	defer cancel()
+	snap, err := s.mihomoMgr.UpdateConfig(ctx, body.Enabled, body.Subscriptions, body.AutoProbeEnabled, body.AutoProbeIntervalMin, body.MaxNodes)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":    err.Error(),
@@ -77,7 +83,9 @@ func (s *Server) handleAdminMihomoRefresh(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "mihomo 订阅代理桥未初始化"})
 		return
 	}
-	snap, err := s.mihomoMgr.RefreshSubscriptions(r.Context())
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+	defer cancel()
+	snap, err := s.mihomoMgr.RefreshSubscriptions(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":    err.Error(),

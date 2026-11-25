@@ -33,6 +33,7 @@ type bridgeDiskState struct {
 	Enabled              bool      `json:"enabled"`
 	Subscriptions        []string  `json:"subscriptions"`
 	BasePort             int       `json:"base_port"`
+	MaxNodes             int       `json:"max_nodes"`
 	MixedPort            int       `json:"mixed_port"`
 	Controller           string    `json:"controller"`
 	Secret               string    `json:"secret"`
@@ -52,6 +53,7 @@ type Snapshot struct {
 	Enabled              bool          `json:"enabled"`
 	Subscriptions        []string      `json:"subscriptions"`
 	BasePort             int           `json:"base_port"`
+	MaxNodes             int           `json:"max_nodes"`
 	AutoProbeEnabled     bool          `json:"auto_probe_enabled"`
 	AutoProbeIntervalMin int           `json:"auto_probe_interval_min"`
 	LastProbeAt          string        `json:"last_probe_at,omitempty"`
@@ -116,7 +118,7 @@ func NewManager(baseDir, dataDir string, logger *logging.Logger) (*Manager, erro
 		statePath:    filepath.Join(dataDir, "mihomo_bridge.json"),
 		logger:       logger,
 		wakeCh:       make(chan struct{}, 1),
-		httpCtl:      &http.Client{Timeout: 8 * time.Second},
+		httpCtl:      &http.Client{Timeout: 30 * time.Second},
 		dlClient:     &http.Client{Timeout: 8 * time.Minute},
 		mirrorPrefix: DefaultMirrorPrefix,
 		githubBase:   DefaultGitHubReleaseBase,
@@ -128,6 +130,7 @@ func NewManager(baseDir, dataDir string, logger *logging.Logger) (*Manager, erro
 			Enabled:              false,
 			Subscriptions:        []string{"", "", ""},
 			BasePort:             defaultBasePort,
+			MaxNodes:             DefaultMaxNodes,
 			MixedPort:            defaultMixedPort,
 			Controller:           defaultController,
 			Secret:               randomHex(8),
@@ -180,6 +183,24 @@ func normalizeProbeMin(v int) int {
 	return v
 }
 
+// scaledStartWait 按节点规模放宽 mihomo 启动等待时间（每个监听端口都会增加配置解析与监听初始化耗时）。
+func scaledStartWait(nodeCount int) time.Duration {
+	d := 10*time.Second + time.Duration(nodeCount)*20*time.Millisecond
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
+	}
+	return d
+}
+
+// scaledProbeTimeout 按节点规模放宽整体测速超时，避免大订阅只完成一小部分节点测速。
+func scaledProbeTimeout(nodeCount int) time.Duration {
+	d := 60*time.Second + time.Duration(nodeCount)*300*time.Millisecond
+	if d > 20*time.Minute {
+		d = 20 * time.Minute
+	}
+	return d
+}
+
 func (m *Manager) loadState() {
 	raw, err := os.ReadFile(m.statePath)
 	if err != nil {
@@ -192,6 +213,12 @@ func (m *Manager) loadState() {
 	st.Subscriptions = normalizeSubs(st.Subscriptions)
 	if st.BasePort < 1024 || st.BasePort > 60000 {
 		st.BasePort = defaultBasePort
+	}
+	if st.MaxNodes <= 0 {
+		st.MaxNodes = DefaultMaxNodes
+	}
+	if st.MaxNodes > MaxNodesLimit {
+		st.MaxNodes = MaxNodesLimit
 	}
 	if st.MixedPort < 1024 || st.MixedPort > 65535 {
 		st.MixedPort = defaultMixedPort
@@ -241,8 +268,15 @@ func (m *Manager) Start(ctx context.Context) {
 	m.mu.RUnlock()
 
 	if shouldBoot {
+		m.mu.RLock()
+		nodeCnt := len(m.state.Nodes)
+		m.mu.RUnlock()
+		bootWait := 25 * time.Second
+		if nodeCnt > 0 {
+			bootWait = scaledStartWait(nodeCnt) + 5*time.Second
+		}
 		go func() {
-			bootCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			bootCtx, cancel := context.WithTimeout(ctx, bootWait)
 			defer cancel()
 			if err := m.ensureProcessRunning(bootCtx); err != nil {
 				if m.logger != nil {
@@ -251,13 +285,10 @@ func (m *Manager) Start(ctx context.Context) {
 				return
 			}
 			// 若已有节点列表则延迟测一次速，否则拉取一次订阅节点
-			m.mu.RLock()
-			nodeCnt := len(m.state.Nodes)
-			m.mu.RUnlock()
 			if nodeCnt == 0 {
 				_, _ = m.RefreshSubscriptions(bootCtx)
 			} else {
-				probeCtx, pCancel := context.WithTimeout(ctx, 45*time.Second)
+				probeCtx, pCancel := context.WithTimeout(ctx, scaledProbeTimeout(nodeCnt))
 				defer pCancel()
 				_, _ = m.ProbeAllNodes(probeCtx)
 			}
@@ -288,9 +319,10 @@ func (m *Manager) Start(ctx context.Context) {
 			case <-timer.C:
 				m.mu.RLock()
 				en := m.state.Enabled && m.state.AutoProbeEnabled && len(m.state.Nodes) > 0
+				nodeCnt := len(m.state.Nodes)
 				m.mu.RUnlock()
 				if en && m.IsRunning() {
-					probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+					probeCtx, cancel := context.WithTimeout(ctx, scaledProbeTimeout(nodeCnt))
 					_, _ = m.ProbeAllNodes(probeCtx)
 					cancel()
 				}
@@ -360,6 +392,7 @@ func (m *Manager) Snapshot() Snapshot {
 		Enabled:              m.state.Enabled,
 		Subscriptions:        append([]string(nil), m.state.Subscriptions...),
 		BasePort:             m.state.BasePort,
+		MaxNodes:             m.state.MaxNodes,
 		AutoProbeEnabled:     m.state.AutoProbeEnabled,
 		AutoProbeIntervalMin: m.state.AutoProbeIntervalMin,
 		LastProbeAt:          m.state.LastProbeAt,
@@ -535,8 +568,8 @@ func (m *Manager) StartDownload() (DownloadState, error) {
 	return snap, nil
 }
 
-// UpdateConfig 更新订阅链接、开关或后台定时测速参数，并按需拉起或停止 mihomo 进程。
-func (m *Manager) UpdateConfig(ctx context.Context, enabled *bool, subs []string, autoProbe *bool, probeMin *int) (Snapshot, error) {
+// UpdateConfig 更新订阅链接、开关、最大映射节点数或后台定时测速参数，并按需拉起或停止 mihomo 进程。
+func (m *Manager) UpdateConfig(ctx context.Context, enabled *bool, subs []string, autoProbe *bool, probeMin *int, maxNodes *int) (Snapshot, error) {
 	needRefresh := false
 	needStop := false
 
@@ -570,6 +603,16 @@ func (m *Manager) UpdateConfig(ctx context.Context, enabled *bool, subs []string
 			return Snapshot{}, errors.New("后台测速间隔必须为 1 ～ 1440 分钟之间的整数")
 		}
 		m.state.AutoProbeIntervalMin = *probeMin
+	}
+	if maxNodes != nil {
+		if *maxNodes < 1 || *maxNodes > MaxNodesLimit {
+			m.mu.Unlock()
+			return Snapshot{}, fmt.Errorf("最大映射节点数必须为 1 ～ %d 之间的整数", MaxNodesLimit)
+		}
+		if m.state.MaxNodes != *maxNodes {
+			m.state.MaxNodes = *maxNodes
+			needRefresh = true
+		}
 	}
 	if err := m.saveStateLocked(); err != nil {
 		m.mu.Unlock()
@@ -612,8 +655,8 @@ func (m *Manager) RefreshSubscriptions(ctx context.Context) (Snapshot, error) {
 		return m.Snapshot(), err
 	}
 
-	// 2. 等待 proxy-providers 拉取就绪（最多 15 秒）
-	rawNodes, err := m.waitForProviderNodes(ctx, 15*time.Second)
+	// 2. 等待 proxy-providers 拉取就绪（最多 30 秒，兼容 1MB+ 的大订阅）
+	rawNodes, err := m.waitForProviderNodes(ctx, 30*time.Second)
 	if err != nil {
 		m.setLastError(err.Error())
 		return m.Snapshot(), err
@@ -627,7 +670,7 @@ func (m *Manager) RefreshSubscriptions(ctx context.Context) (Snapshot, error) {
 	}
 
 	m.mu.Lock()
-	assigned := AssignStableNodePorts(realNames, m.state.Nodes, m.state.BasePort, 120)
+	assigned := AssignStableNodePorts(realNames, m.state.Nodes, m.state.BasePort, m.state.MaxNodes)
 	m.state.Nodes = SortNodesByDelay(assigned)
 	m.state.Enabled = true
 	m.filteredFake = filteredFake
@@ -652,7 +695,7 @@ func (m *Manager) RefreshSubscriptions(ctx context.Context) (Snapshot, error) {
 	// 5. 异步触发一轮并发测速
 	if len(assigned) > 0 {
 		go func() {
-			pCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			pCtx, cancel := context.WithTimeout(context.Background(), scaledProbeTimeout(len(assigned)))
 			defer cancel()
 			_, _ = m.ProbeAllNodes(pCtx)
 		}()
@@ -693,6 +736,10 @@ func (m *Manager) ProbeAllNodes(ctx context.Context) (Snapshot, error) {
 
 	// 优先尝试 /group/PROXY/delay 组测速；未命中节点走 8 并发单节点补测
 	delayMap := m.probeGroupDelay(ctx, ctl, secret)
+	if ctx.Err() != nil {
+		// 调用方已取消/超时，放弃本轮结果，避免把未测节点误标为超时
+		return m.Snapshot(), ctx.Err()
+	}
 
 	sem := make(chan struct{}, probeConcurrency)
 	var wg sync.WaitGroup
@@ -712,6 +759,9 @@ func (m *Manager) ProbeAllNodes(ctx context.Context) (Snapshot, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			d := m.probeSingleDelay(ctx, ctl, secret, nodeName)
+			if ctx.Err() != nil {
+				return
+			}
 			mapMu.Lock()
 			nodes[idx].DelayMS = d
 			nodes[idx].CheckedAt = nowStr
@@ -719,6 +769,10 @@ func (m *Manager) ProbeAllNodes(ctx context.Context) (Snapshot, error) {
 		}(i, name)
 	}
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		return m.Snapshot(), ctx.Err()
+	}
 
 	sorted := SortNodesByDelay(nodes)
 	m.mu.Lock()
@@ -850,8 +904,12 @@ func (m *Manager) restartProcess(ctx context.Context) error {
 	m.cmdDone = done
 	m.procMu.Unlock()
 
-	// 等待控制端口就绪（最多 10 秒）
-	deadline := time.Now().Add(10 * time.Second)
+	m.mu.RLock()
+	nodeCount := len(m.state.Nodes)
+	m.mu.RUnlock()
+
+	// 等待控制端口就绪（节点越多，配置解析与监听初始化越慢）
+	deadline := time.Now().Add(scaledStartWait(nodeCount))
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():

@@ -7,6 +7,13 @@ import (
 	"strings"
 )
 
+const (
+	// DefaultMaxNodes 是订阅桥默认映射的最大真实节点数（本地回环端口从 BasePort 顺延分配）。
+	DefaultMaxNodes = 2000
+	// MaxNodesLimit 是允许配置的节点数上限，防止监听端口与进程资源被耗尽。
+	MaxNodesLimit = 5000
+)
+
 // SubNode 表示由单 mihomo 进程映射出的一个真实机场订阅节点及其独立本地回环端口。
 type SubNode struct {
 	Name      string `json:"name"`
@@ -111,7 +118,10 @@ func AssignStableNodePorts(validNames []string, prevNodes []SubNode, basePort, m
 		basePort = 20001
 	}
 	if maxNodes <= 0 {
-		maxNodes = 120
+		maxNodes = DefaultMaxNodes
+	}
+	if maxNodes > MaxNodesLimit {
+		maxNodes = MaxNodesLimit
 	}
 	real := FilterRealNodes(validNames)
 	if len(real) > maxNodes {
@@ -208,10 +218,10 @@ func YAMLQuote(s string) string {
 }
 
 // BuildConfigYAML 生成防 502 的单 mihomo 进程配置：
-// 1. 在 proxy-providers 段配置全部机场订阅链接（sub1..subN）；
-// 2. 在 proxy-groups 段先为每个真实节点创建 PUB-<端口> 精确过滤组（use + filter: "^<正则转义节点名>$"）；
-// 3. 在 listeners 段为每个节点创建仅监听 127.0.0.1 的 mixed 独立端口，并将 proxy 指向对应 PUB-<端口> 组名
-//    （严禁直接填订阅节点名，避免 mihomo 启动阶段报 proxy not found 引发 502）。
+//  1. 在 proxy-providers 段配置全部机场订阅链接（sub1..subN）；
+//  2. 在 proxy-groups 段先为每个真实节点创建 PUB-<端口> 精确过滤组（use + filter: "^<正则转义节点名>$"）；
+//  3. 在 listeners 段为每个节点创建仅监听 127.0.0.1 的 mixed 独立端口，并将 proxy 指向对应 PUB-<端口> 组名
+//     （严禁直接填订阅节点名，避免 mihomo 启动阶段报 proxy not found 引发 502）。
 func BuildConfigYAML(opts ConfigOptions) string {
 	mixedPort := opts.MixedPort
 	if mixedPort < 1024 || mixedPort > 65535 {

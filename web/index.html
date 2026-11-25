@@ -686,6 +686,8 @@ footer{
                 <span class="dim">每</span>
                 <input type="number" id="mhProbeMin" min="1" max="1440" value="10" style="width:76px">
                 <span class="dim">分钟</span>
+                <span class="dim" style="margin-left:8px">最大映射节点数</span>
+                <input type="number" id="mhMaxNodes" min="1" max="5000" value="2000" style="width:86px" title="默认 2000，最多 5000；节点越多，mihomo 启动与资源占用越高">
               </div>
             </div>
           </div>
@@ -1893,6 +1895,8 @@ function renderMihomoSnapshot(ms){
   if (apEl) apEl.checked = ms.auto_probe_enabled !== false;
   const pmEl = document.getElementById('mhProbeMin');
   if (pmEl && document.activeElement !== pmEl) pmEl.value = ms.auto_probe_interval_min || 10;
+  const mnEl = document.getElementById('mhMaxNodes');
+  if (mnEl && document.activeElement !== mnEl) mnEl.value = ms.max_nodes || 2000;
 
   const summaryEl = document.getElementById('mhNodeSummary');
   if (summaryEl){
@@ -1966,12 +1970,13 @@ async function saveMihomoSubscriptions(){
   const enabled = document.getElementById('mhEnabled').checked || hasSub;
   const auto_probe_enabled = document.getElementById('mhAutoProbe').checked;
   const auto_probe_interval_min = Math.max(1, Math.min(1440, parseInt(document.getElementById('mhProbeMin').value, 10) || 10));
+  const max_nodes = Math.max(1, Math.min(5000, parseInt(document.getElementById('mhMaxNodes').value, 10) || 2000));
   if (btn) btn.disabled = true;
   try{
     toast('正在保存订阅配置并同步机场节点…');
     const res = await apiFetch('/api/admin/mihomo/config', {
       method:'PUT',
-      body: JSON.stringify({ enabled, subscriptions: subs, auto_probe_enabled, auto_probe_interval_min })
+      body: JSON.stringify({ enabled, subscriptions: subs, auto_probe_enabled, auto_probe_interval_min, max_nodes })
     });
     toast(res.message);
     if (res.snapshot) renderMihomoSnapshot(res.snapshot);
