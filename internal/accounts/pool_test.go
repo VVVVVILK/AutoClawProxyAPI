@@ -3,6 +3,7 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -211,6 +212,57 @@ func TestPoolModelScopedQuotaCooldown(t *testing.T) {
 	acc2, _ := pool.GetByID("autoclawcn-q2")
 	if acc2.CooldownUntil.IsZero() || acc2.CooldownKind != "hard_credit" {
 		t.Fatalf("账号级额度错误应设置账号级冷却: %+v", acc2)
+	}
+}
+
+func TestRouterRoutingSurvivesCooldownAndNoActiveSentinel(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	dataDir := filepath.Join(dir, "data")
+	mgr, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Update(func(c *config.Config) error {
+		c.AuthDir = authDir
+		c.DataDir = dataDir
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"autoclawcn-r1.json": `{"region":"cn","accessToken":"tok-r1","userId":"r1"}`,
+		"autoclawcn-r2.json": `{"region":"cn","accessToken":"tok-r2","userId":"r2"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(authDir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool, err := NewPool(mgr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyMgr, err := proxypool.NewManager(dataDir, config.ProxyConfig{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(mgr, pool, proxyMgr, nil)
+
+	// 1. 账号级冷却不应让未同步目录的透传模型变成「模型不存在」
+	pool.ReportError("autoclawcn-r1", protocol.ClassifyError(402, 0, "余额不足", 0))
+	targets, err := router.ResolveTargets("never-synced-model")
+	if err != nil || len(targets) != 1 || targets[0].Region != protocol.RegionCN {
+		t.Fatalf("账号冷却时仍应下发透传路由目标: targets=%+v err=%v", targets, err)
+	}
+
+	// 2. 双区均无活跃账号时应返回明确哨兵错误，便于网关映射为 503
+	pool.ReportError("autoclawcn-r1", protocol.ClassifyError(200, 410000, "not logged in", 0))
+	pool.ReportError("autoclawcn-r2", protocol.ClassifyError(200, 410000, "not logged in", 0))
+	if _, err := router.ResolveTargets("never-synced-model"); !errors.Is(err, ErrNoActiveAccount) {
+		t.Fatalf("无活跃账号时应返回 ErrNoActiveAccount，实际: %v", err)
 	}
 }
 
