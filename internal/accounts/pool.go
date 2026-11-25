@@ -523,6 +523,10 @@ func (p *Pool) ModelQuotaCooldown(model string) (time.Duration, bool) {
 	var best time.Duration
 	found := false
 	for _, acc := range p.items {
+		// 已停用或已失效账号不参与调度，其残留的模型冷却不应影响对外错误判定。
+		if acc.Cred.Disabled || acc.SessionDead {
+			continue
+		}
 		st, ok := acc.ModelCooldowns[key]
 		if !ok || !now.Before(st.Until) {
 			continue

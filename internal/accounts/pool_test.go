@@ -213,6 +213,15 @@ func TestPoolModelScopedQuotaCooldown(t *testing.T) {
 	if acc2.CooldownUntil.IsZero() || acc2.CooldownKind != "hard_credit" {
 		t.Fatalf("账号级额度错误应设置账号级冷却: %+v", acc2)
 	}
+
+	// 5. 已停用账号上残留的模型冷却不应影响对外错误判定
+	disabled := true
+	if err := pool.UpdateMeta("autoclawcn-q1", nil, nil, &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if _, cooling := pool.ModelQuotaCooldown("zaicoding_glm-5.3"); cooling {
+		t.Fatalf("已停用账号的残留模型冷却不应参与错误判定")
+	}
 }
 
 func TestRouterRoutingSurvivesCooldownAndNoActiveSentinel(t *testing.T) {
@@ -226,6 +235,7 @@ func TestRouterRoutingSurvivesCooldownAndNoActiveSentinel(t *testing.T) {
 	if _, err := mgr.Update(func(c *config.Config) error {
 		c.AuthDir = authDir
 		c.DataDir = dataDir
+		c.Routing.Aliases = map[string][]string{"auto-alias": {"never-synced-model"}}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -257,12 +267,19 @@ func TestRouterRoutingSurvivesCooldownAndNoActiveSentinel(t *testing.T) {
 	if err != nil || len(targets) != 1 || targets[0].Region != protocol.RegionCN {
 		t.Fatalf("账号冷却时仍应下发透传路由目标: targets=%+v err=%v", targets, err)
 	}
+	aliasTargets, err := router.ResolveTargets("auto-alias")
+	if err != nil || len(aliasTargets) != 1 || aliasTargets[0].Region != protocol.RegionCN {
+		t.Fatalf("账号冷却时别名仍应解析到透传目标: targets=%+v err=%v", aliasTargets, err)
+	}
 
 	// 2. 双区均无活跃账号时应返回明确哨兵错误，便于网关映射为 503
 	pool.ReportError("autoclawcn-r1", protocol.ClassifyError(200, 410000, "not logged in", 0))
 	pool.ReportError("autoclawcn-r2", protocol.ClassifyError(200, 410000, "not logged in", 0))
 	if _, err := router.ResolveTargets("never-synced-model"); !errors.Is(err, ErrNoActiveAccount) {
 		t.Fatalf("无活跃账号时应返回 ErrNoActiveAccount，实际: %v", err)
+	}
+	if _, err := router.ResolveTargets("auto-alias"); !errors.Is(err, ErrNoActiveAccount) {
+		t.Fatalf("无活跃账号时别名也应返回 ErrNoActiveAccount，实际: %v", err)
 	}
 }
 

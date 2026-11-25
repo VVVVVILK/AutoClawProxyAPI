@@ -336,19 +336,19 @@ func TestGatewayQuotaErrorDoesNotFreezeOtherModels(t *testing.T) {
 		return nil
 	})
 
-	doChat := func(model string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-			bytes.NewBufferString(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`))
+	doChat := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 		req.Header.Set("Authorization", "Bearer "+vkey)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		return rec
 	}
+	quotaBodyPrefix := `{"model":"zaicoding_glm-5.3","messages":[{"role":"user","content":"hi"}],"max_tokens":10`
 
-	// 1. 额度耗尽模型：返回 402 hard_credit，且账号池不得出现 session_dead
-	rec1 := doChat("zaicoding_glm-5.3")
+	// 1. 流式请求额度耗尽模型（与问题反馈日志一致）：返回 402 hard_credit，且账号池不得出现 session_dead
+	rec1 := doChat(quotaBodyPrefix + `,"stream":true}`)
 	if rec1.Code != http.StatusPaymentRequired || !strings.Contains(rec1.Body.String(), string(protocol.ErrorKindHardCredit)) {
-		t.Fatalf("额度耗尽模型应返回 402 hard_credit，实际: %d %s", rec1.Code, rec1.Body.String())
+		t.Fatalf("流式额度耗尽模型应返回 402 hard_credit，实际: %d %s", rec1.Code, rec1.Body.String())
 	}
 	if stats := srv.pool.Stats(); stats.Dead != 0 || stats.ReadyTotal == 0 {
 		t.Fatalf("额度错误不应冻结账号池: %+v", stats)
@@ -358,14 +358,14 @@ func TestGatewayQuotaErrorDoesNotFreezeOtherModels(t *testing.T) {
 	}
 
 	// 2. 其它模型应立即恢复可用（文档复现步骤 3 的核心验收点）
-	rec2 := doChat("zai_auto")
+	rec2 := doChat(`{"model":"zai_auto","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
 	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), "正常回复") {
 		t.Fatalf("其它模型应不受额度错误影响，实际: %d %s", rec2.Code, rec2.Body.String())
 	}
 
-	// 3. 再次请求额度模型：直接 402，不再重复打上游
+	// 3. 非流式再次请求额度模型：直接 402，不再重复打上游
 	before := quotaHits.Load()
-	rec3 := doChat("zaicoding_glm-5.3")
+	rec3 := doChat(quotaBodyPrefix + `}`)
 	if rec3.Code != http.StatusPaymentRequired {
 		t.Fatalf("额度模型冷却中应直接返回 402，实际: %d %s", rec3.Code, rec3.Body.String())
 	}

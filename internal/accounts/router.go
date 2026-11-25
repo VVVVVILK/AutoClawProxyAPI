@@ -248,6 +248,9 @@ func (r *Router) ResolveTargets(requested string) ([]RouteTarget, error) {
 			expanded = append(expanded, r.resolveSingleSpec(targetSpec)...)
 		}
 		if len(expanded) == 0 {
+			if !r.hasActiveAccount(protocol.RegionCN) && !r.hasActiveAccount(protocol.RegionGlobal) {
+				return nil, ErrNoActiveAccount
+			}
 			return nil, fmt.Errorf("别名 %s 指向的目标模型均不可用或已禁用", modelName)
 		}
 		if len(expanded) > 1 {
