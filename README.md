@@ -40,7 +40,7 @@
   - `POST /v1/messages`：支持 Anthropic Messages API 双向转换（System Prompt、多模态、Tool Use / Tool Result、Thinking / Reasoning 字段与流式 SSE 事件），可直接接入 Claude Code 等客户端。
 - **双区实时模型同步与多账号高可用**
   - 双区（`autoclawcn` 与 `autoclawglobal`）统一在存在已登录且启用账号时，实时向对应区域上游请求 `/autoclaw-proxy/proxy/autoclaw-model-config` 同步模型，不预置静态假列表；当某区域无有效账号时自动清空并不暴露。
-  - 多账号轮询负载均衡、失败自动切号、指数退避重试（识别 `Retry-After`）与错误分级冷却（会话失效暂停调度、积分不足长冷却、429 限流短冷却）。
+  - 多账号轮询负载均衡、失败自动切号、指数退避重试（识别 `Retry-After`）与错误分级冷却（会话失效暂停调度、积分不足长冷却、429 限流短冷却；单个模型的免费额度耗尽按「账号 + 模型」级长冷却，不影响同账号其它模型）。
   - 支持凭证目录热扫描与无损 JSON 合并写回、Token 自动续期、每日定时签到并上报登录活跃。
 - **独立代理池与「一号一代理」**
   - 批量导入 `http://`、`https://`、`socks5://`、`socks5h://` 代理（支持多行 URI、Base64 订阅与 Clash YAML 节点自动解析、去重与逐条反馈）。
