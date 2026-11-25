@@ -306,3 +306,70 @@ func TestStickySessionAcrossAllThreeEndpointsAndStreamIncludeUsage(t *testing.T)
 		t.Fatalf("/v1/messages metadata.user_id 未保持粘性: %+v", seenAuths)
 	}
 }
+
+func TestGatewayQuotaErrorDoesNotFreezeOtherModels(t *testing.T) {
+	var quotaHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != protocol.PathChat {
+			http.NotFound(w, r)
+			return
+		}
+		var reqMap map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&reqMap)
+		model, _ := reqMap["model"].(string)
+		if model == "zaicoding_glm-5.3" {
+			quotaHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":810000,"message":"GLM-5.3 free quota used up. Subscribe to a membership to continue."}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-ok","object":"chat.completion","model":"zai_auto","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"正常回复"}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`))
+	}))
+	defer upstream.Close()
+
+	srv, handler, _, cfgMgr := setupTestServer(t, upstream.URL)
+	vkey := config.GenerateVKey()
+	_, _ = cfgMgr.Update(func(c *config.Config) error {
+		c.APIKeys = []config.APIKeyItem{{ID: "k1", Name: "主密钥", Key: vkey, Enabled: true}}
+		return nil
+	})
+
+	doChat := func(model string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			bytes.NewBufferString(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`))
+		req.Header.Set("Authorization", "Bearer "+vkey)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. 额度耗尽模型：返回 402 hard_credit，且账号池不得出现 session_dead
+	rec1 := doChat("zaicoding_glm-5.3")
+	if rec1.Code != http.StatusPaymentRequired || !strings.Contains(rec1.Body.String(), string(protocol.ErrorKindHardCredit)) {
+		t.Fatalf("额度耗尽模型应返回 402 hard_credit，实际: %d %s", rec1.Code, rec1.Body.String())
+	}
+	if stats := srv.pool.Stats(); stats.Dead != 0 || stats.ReadyTotal == 0 {
+		t.Fatalf("额度错误不应冻结账号池: %+v", stats)
+	}
+	if quotaHits.Load() == 0 {
+		t.Fatalf("预期上游收到额度模型请求")
+	}
+
+	// 2. 其它模型应立即恢复可用（文档复现步骤 3 的核心验收点）
+	rec2 := doChat("zai_auto")
+	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), "正常回复") {
+		t.Fatalf("其它模型应不受额度错误影响，实际: %d %s", rec2.Code, rec2.Body.String())
+	}
+
+	// 3. 再次请求额度模型：直接 402，不再重复打上游
+	before := quotaHits.Load()
+	rec3 := doChat("zaicoding_glm-5.3")
+	if rec3.Code != http.StatusPaymentRequired {
+		t.Fatalf("额度模型冷却中应直接返回 402，实际: %d %s", rec3.Code, rec3.Body.String())
+	}
+	if quotaHits.Load() != before {
+		t.Fatalf("模型级冷却中不应再次请求上游: before=%d after=%d", before, quotaHits.Load())
+	}
+}
